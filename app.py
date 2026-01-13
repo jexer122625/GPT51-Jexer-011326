@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 from io import BytesIO
+import base64
 
 import streamlit as st
 import yaml
@@ -12,6 +13,15 @@ try:
     from docx import Document  # provided by python-docx
 except ImportError:
     Document = None
+
+# Optional PDF-generation library
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+except ImportError:
+    canvas = None
+    letter = None
+
 # External LLM clients
 from openai import OpenAI
 import google.generativeai as genai
@@ -410,6 +420,95 @@ def extract_docx_to_text(file) -> str:
         return ""
 
 
+# ===== New helpers for DOCX/DOC → PDF + Preview + OCR =====
+
+def create_pdf_from_text(text: str) -> bytes:
+    """Create a simple multi-page PDF from plain text using reportlab."""
+    if canvas is None or letter is None:
+        raise RuntimeError(
+            "PDF generation library 'reportlab' is not installed. "
+            "Please add 'reportlab' to your Space requirements."
+        )
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+    margin = 72  # 1 inch
+    line_height = 14
+    y = height - margin
+
+    for line in text.splitlines():
+        if y < margin:
+            c.showPage()
+            y = height - margin
+        # Basic truncation to avoid drawing outside page width
+        c.drawString(margin, y, line[:2000])
+        y -= line_height
+
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def convert_office_to_pdf(uploaded_file) -> tuple[bytes, int]:
+    """
+    Convert DOCX/DOC to PDF bytes.
+    - DOCX: via python-docx
+    - DOC: best-effort; requires optional libraries, otherwise a clear error.
+    Returns (pdf_bytes, page_count).
+    """
+    filename = uploaded_file.name or "document"
+    suffix = filename.lower().rsplit(".", 1)[-1]
+    file_bytes = uploaded_file.read()
+
+    text = ""
+
+    if suffix == "docx":
+        if Document is None:
+            raise RuntimeError(
+                "DOCX conversion requires 'python-docx', which is not installed."
+            )
+        text = extract_docx_to_text(BytesIO(file_bytes))
+
+    elif suffix == "doc":
+        # Best-effort using optional 'textract' (if available)
+        try:
+            import textract  # type: ignore
+            text = textract.process(BytesIO(file_bytes)).decode("utf-8", errors="ignore")
+        except Exception:
+            raise RuntimeError(
+                "DOC (legacy Word) conversion requires an additional package "
+                "(e.g., 'textract' + system dependencies) which is not available "
+                "in this environment. Please convert the file to DOCX or PDF and upload again."
+            )
+    else:
+        raise RuntimeError("Only DOCX and DOC files are supported in this converter.")
+
+    if not text.strip():
+        raise RuntimeError("No extractable text found in the uploaded document.")
+
+    pdf_bytes = create_pdf_from_text(text)
+    reader = PdfReader(BytesIO(pdf_bytes))
+    page_count = len(reader.pages)
+    return pdf_bytes, page_count
+
+
+def show_pdf(pdf_bytes: bytes, height: int = 600):
+    """Inline PDF preview using an iframe."""
+    if not pdf_bytes:
+        return
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    pdf_html = f"""
+        <iframe
+            src="data:application/pdf;base64,{b64}"
+            width="100%"
+            height="{height}"
+            type="application/pdf">
+        </iframe>
+    """
+    st.markdown(pdf_html, unsafe_allow_html=True)
+
+
 def agent_run_ui(
     agent_id: str,
     tab_key: str,
@@ -730,17 +829,179 @@ Additional context:
 
 
 def render_pdf_to_md_tab():
-    st.title("PDF → Markdown Transformer")
+    st.title("PDF & Office Transformer")
 
-    uploaded = st.file_uploader("Upload 510(k) or related PDF", type=["pdf"])
+    # -----------------------------
+    # 1. DOCX/DOC → PDF + OCR (Gemini)
+    # -----------------------------
+    st.markdown("### 1. DOCX/DOC → PDF with OCR (Gemini 2.5 Flash)")
+
+    office_file = st.file_uploader(
+        "Upload DOCX or DOC file",
+        type=["docx", "doc"],
+        key="office_to_pdf_uploader",
+    )
+
+    if office_file is not None:
+        if st.button("Convert to PDF", key="convert_office_to_pdf_btn"):
+            try:
+                pdf_bytes, page_count = convert_office_to_pdf(office_file)
+                st.session_state["ocr_pdf_bytes"] = pdf_bytes
+                st.session_state["ocr_pdf_page_count"] = page_count
+                st.success(f"Converted to PDF with {page_count} page(s).")
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
+
+    pdf_bytes = st.session_state.get("ocr_pdf_bytes", None)
+    page_count = st.session_state.get("ocr_pdf_page_count", None)
+
+    if pdf_bytes:
+        st.markdown("#### Generated PDF Preview")
+        show_pdf(pdf_bytes, height=600)
+
+        st.download_button(
+            "Download generated PDF",
+            data=pdf_bytes,
+            file_name="converted_document.pdf",
+            mime="application/pdf",
+            key="download_converted_pdf",
+        )
+
+        if page_count is None:
+            # Recompute page count if missing
+            reader = PdfReader(BytesIO(pdf_bytes))
+            page_count = len(reader.pages)
+            st.session_state["ocr_pdf_page_count"] = page_count
+
+        st.markdown("#### OCR on Selected Pages (Gemini 2.5 Flash)")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            from_page = st.number_input(
+                "From page",
+                min_value=1,
+                max_value=page_count,
+                value=1,
+                key="ocr_from_page",
+            )
+        with col2:
+            to_page = st.number_input(
+                "To page",
+                min_value=1,
+                max_value=page_count,
+                value=page_count,
+                key="ocr_to_page",
+            )
+
+        if st.button("Run OCR (Gemini 2.5 Flash)", key="run_ocr_gemini_btn"):
+            if from_page > to_page:
+                st.error("`From page` must be <= `To page`.")
+            else:
+                try:
+                    text_for_ocr = extract_pdf_pages_to_text(
+                        BytesIO(pdf_bytes),
+                        int(from_page),
+                        int(to_page),
+                    )
+                    if not text_for_ocr.strip():
+                        st.warning("No text extracted from the selected pages.")
+                    else:
+                        api_keys = st.session_state.get("api_keys", {})
+
+                        system_prompt = f"""
+You are an OCR post-processor using the Gemini 2.5 Flash model.
+
+Input: noisy or unstructured text extracted from scanned or converted document pages.
+
+Tasks:
+1. Reconstruct the content as clean, well-structured markdown.
+   - Preserve logical headings, lists, and tables (as markdown tables) where possible.
+   - Fix obvious OCR errors (broken words, merged lines, split words).
+2. Do NOT hallucinate new content. Only rewrite/clean what is present.
+3. Identify important domain-specific keywords (technical terms, product names,
+   standards, test types, risks, regulatory concepts).
+4. Wrap each important keyword or short phrase in an HTML span with coral color and
+   semi-bold weight, so that it renders nicely in markdown:
+
+   Example:
+   <span style="color:coral;font-weight:600;">predicate device</span>
+
+5. Output must be valid markdown with inline HTML spans for the highlighted keywords.
+
+Language: {st.session_state.settings["language"]}.
+"""
+
+                        user_prompt = text_for_ocr
+
+                        with st.spinner("Running Gemini OCR to markdown..."):
+                            out = call_llm(
+                                model="gemini-2.5-flash",
+                                system_prompt=system_prompt,
+                                user_prompt=user_prompt,
+                                max_tokens=st.session_state.settings["max_tokens"],
+                                temperature=0.1,
+                                api_keys=api_keys,
+                            )
+
+                        st.session_state["ocr_md_output"] = out
+                        token_est = int(len(user_prompt + out) / 4)
+                        log_event(
+                            "PDF → OCR",
+                            "Gemini-2.5-Flash OCR Markdown",
+                            "gemini-2.5-flash",
+                            token_est,
+                        )
+                        st.success("OCR complete.")
+
+                except Exception as e:
+                    st.error(f"OCR failed: {e}")
+
+        ocr_md = st.session_state.get("ocr_md_output", "")
+        if ocr_md:
+            st.markdown("##### OCR Result (editable)")
+
+            view_mode = st.radio(
+                "View mode",
+                ["Markdown", "Plain text"],
+                horizontal=True,
+                key="ocr_output_viewmode",
+            )
+            if view_mode == "Markdown":
+                edited = st.text_area(
+                    "OCR Markdown (editable)",
+                    value=ocr_md,
+                    height=320,
+                    key="ocr_md_edited",
+                )
+            else:
+                edited = st.text_area(
+                    "OCR Text (editable)",
+                    value=ocr_md,
+                    height=320,
+                    key="ocr_txt_edited",
+                )
+
+            st.session_state["ocr_effective_text"] = edited
+
+    st.markdown("---")
+    # -----------------------------
+    # 2. Classic PDF → Markdown Agent (original feature)
+    # -----------------------------
+    st.markdown("### 2. Classic PDF → Markdown Transformer (Agent)")
+
+    uploaded = st.file_uploader(
+        "Upload 510(k) or related PDF for direct PDF → Markdown",
+        type=["pdf"],
+        key="pdf_to_md_uploader",
+    )
     if uploaded:
         col1, col2 = st.columns(2)
         with col1:
-            num_start = st.number_input("From page", min_value=1, value=1)
+            num_start = st.number_input("From page", min_value=1, value=1, key="pdf_to_md_from")
         with col2:
-            num_end = st.number_input("To page", min_value=1, value=10)
+            num_end = st.number_input("To page", min_value=1, value=10, key="pdf_to_md_to")
 
-        if st.button("Extract Pages"):
+        if st.button("Extract Pages", key="pdf_to_md_extract_btn"):
             text = extract_pdf_pages_to_text(uploaded, int(num_start), int(num_end))
             st.session_state["pdf_raw_text"] = text
 
@@ -765,7 +1026,7 @@ Language: {st.session_state.settings["language"]}.
             tab_label_for_history="PDF → Markdown",
         )
     else:
-        st.info("Upload a PDF and click 'Extract Pages' to begin.")
+        st.info("Upload a PDF and click 'Extract Pages' to begin, or use the DOCX/DOC → PDF workflow above.")
 
 
 def render_summary_tab():

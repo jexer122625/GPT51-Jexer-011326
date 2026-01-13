@@ -10,3 +10,6 @@ PyYAML
 altair
 httpx
 python-docx
+anthropic
+httpx
+reportlab
